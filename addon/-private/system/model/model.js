@@ -16,6 +16,9 @@ import recordDataFor from '../record-data-for';
 import Ember from 'ember';
 import InternalModel from './internal-model';
 import RootState from './states';
+import { errorsHashToArray, errorsArrayToHash, InvalidError } from '../../adapters/errors';
+import { identifierForModel } from '../record-identifier';
+import { request } from 'http';
 const { changeProperties } = Ember;
 
 /**
@@ -33,14 +36,14 @@ function findPossibleInverses(type, inverseType, name, relationshipsSoFar) {
   let relationshipsForType = relationshipMap.get(type.modelName);
   let relationships = Array.isArray(relationshipsForType)
     ? relationshipsForType.filter(relationship => {
-        let optionsForRelationship = inverseType.metaForProperty(relationship.name).options;
+      let optionsForRelationship = inverseType.metaForProperty(relationship.name).options;
 
-        if (!optionsForRelationship.inverse && optionsForRelationship.inverse !== null) {
-          return true;
-        }
+      if (!optionsForRelationship.inverse && optionsForRelationship.inverse !== null) {
+        return true;
+      }
 
-        return name === optionsForRelationship.inverse;
-      })
+      return name === optionsForRelationship.inverse;
+    })
     : null;
 
   if (relationships) {
@@ -55,7 +58,11 @@ function findPossibleInverses(type, inverseType, name, relationshipsSoFar) {
   return possibleRelationships;
 }
 
-const retrieveFromCurrentState = computed('currentState', function(key) {
+// THis relies on 1-1 mapping between requests and records
+let ignoreInvalidRequestsMap = new WeakMap();
+let ignoreErrorRequestsMap = new WeakMap();
+
+const retrieveFromCurrentState = computed('currentState', function (key) {
   return get(this._internalModel.currentState, key);
 }).readOnly();
 
@@ -147,7 +154,7 @@ const Model = EmberObject.extend(Evented, {
     @type {Boolean}
     @readOnly
   */
-  hasDirtyAttributes: computed('currentState.isDirty', function() {
+  hasDirtyAttributes: computed('currentState.isDirty', function () {
     return this.get('currentState.isDirty');
   }),
   /**
@@ -172,7 +179,12 @@ const Model = EmberObject.extend(Evented, {
     @type {Boolean}
     @readOnly
   */
-  isSaving: retrieveFromCurrentState,
+  isSaving: computed(function () {
+    let requests = this.store.requestCache.getPending(identifierForModel(this));
+    return !!requests.find((req) => req.query.query.op === 'saveRecord');
+  }).volatile(),
+
+  /**
   /**
     If this property is `true` the record is in the `deleted` state
     and has been marked for deletion. When `isDeleted` is true and
@@ -233,6 +245,8 @@ const Model = EmberObject.extend(Evented, {
     @readOnly
   */
   isNew: retrieveFromCurrentState,
+
+
   /**
     If this property is `true` the record is in the `valid` state.
 
@@ -243,7 +257,88 @@ const Model = EmberObject.extend(Evented, {
     @type {Boolean}
     @readOnly
   */
-  isValid: retrieveFromCurrentState,
+  isValid: computed(function () {
+    if (this.get('errors.length') > 0) {
+      return false;
+    }
+
+    let invalidRequest = this._getInvalidRequest();
+    if (!invalidRequest) {
+      return true;
+    } else {
+      if (this._getInvalidRequestsToIgnore().get(invalidRequest)) {
+        return true;
+      } else {
+        return false;
+      }
+    }
+  }).volatile(),
+  
+  _getInvalidRequest() {
+    let requests = this.store.requestCache.getFinished(identifierForModel(this));
+    return requests.find((req) => req.state === 'rejected' && req.result instanceof InvalidError);
+  },
+
+  _markInvalidRequestAsClean() {
+    let invalidRequest = this._getInvalidRequest();
+    if (invalidRequest) {
+      ignoreInvalidRequestsMap.set(invalidRequest, true);
+    }
+  },
+
+  _getInvalidRequestsToIgnore() {
+    return ignoreInvalidRequestsMap;
+  },
+
+  /**
+    If `true` the adapter reported that it was unable to save local
+    changes to the backend for any reason other than a server-side
+    validation error.
+
+    Example
+
+    ```javascript
+    record.get('isError'); // false
+    record.set('foo', 'valid value');
+    record.save().then(null, function() {
+      record.get('isError'); // true
+    });
+    ```
+
+    @property isError
+    @type {Boolean}
+    @readOnly
+  */
+  isError: computed(function () {
+    let errorReq = this._getErrorRequest();
+    if (!errorReq) {
+      return false;
+    } else {
+      if (ignoreErrorRequestsMap.get(errorReq)) {
+        return false;
+      } else {
+        return true;
+      }
+
+    }
+  }).volatile(),
+
+  _markErrorRequestAsClean() {
+    let errorRequest = this._getErrorRequest();
+    if (errorRequest) {
+      ignoreErrorRequestsMap.set(errorRequest, true);
+    }
+  },
+
+  _getErrorRequestsToIgnore() {
+    return ignoreErrorRequestsMap;
+  },
+
+  _getErrorRequest() {
+    let requests = this.store.requestCache.getFinished(identifierForModel(this));
+    return requests.find((req) => req.state === 'rejected' && !(req.result instanceof InvalidError));
+  },
+
   /**
     If the record is in the dirty state this property will report what
     kind of change has caused it to move into the dirty
@@ -266,26 +361,6 @@ const Model = EmberObject.extend(Evented, {
   */
   dirtyType: retrieveFromCurrentState,
 
-  /**
-    If `true` the adapter reported that it was unable to save local
-    changes to the backend for any reason other than a server-side
-    validation error.
-
-    Example
-
-    ```javascript
-    record.get('isError'); // false
-    record.set('foo', 'valid value');
-    record.save().then(null, function() {
-      record.get('isError'); // true
-    });
-    ```
-
-    @property isError
-    @type {Boolean}
-    @readOnly
-  */
-  isError: false,
 
   /**
     If `true` the store is attempting to reload the record from the adapter.
@@ -293,7 +368,7 @@ const Model = EmberObject.extend(Evented, {
     Example
 
     ```javascript
-    record.get('isReloading'); // false
+    record.get('jjjjing'); // false
     record.reload();
     record.get('isReloading'); // true
     ```
@@ -302,7 +377,11 @@ const Model = EmberObject.extend(Evented, {
     @type {Boolean}
     @readOnly
   */
-  isReloading: false,
+
+  isReloading: computed(function () {
+    let requests = this.store.requestCache.getPending(identifierForModel(this));
+    return !!requests.find((req) => req.query.query.options.isReloading);;
+  }).volatile(),
 
   /**
     All ember models have an id property. This is an identifier
@@ -401,15 +480,15 @@ const Model = EmberObject.extend(Evented, {
     @property errors
     @type {DS.Errors}
   */
-  errors: computed(function() {
+  errors: computed(function () {
     let errors = Errors.create();
 
     errors._registerHandlers(
       this._internalModel,
-      function() {
+      function () {
         this.send('becameInvalid');
       },
-      function() {
+      function () {
         this.send('becameValid');
       }
     );
@@ -423,7 +502,51 @@ const Model = EmberObject.extend(Evented, {
     @property adapterError
     @type {DS.AdapterError}
   */
-  adapterError: null,
+  adapterError: computed(function () {
+    let requests = this.store.requestCache.getFinished(identifierForModel(this));
+    let request = requests.find((req) => req.state === 'rejected');
+    if (request) {
+      return request.result;
+    } else {
+      return null;
+    }
+  }).volatile(),
+
+  invalidErrorsChanged(jsonApiErrors) {
+    this._clearErrorMessages();
+    let errors = errorsArrayToHash(jsonApiErrors);
+    let errorKeys = Object.keys(errors);
+
+    for (let i = 0; i < errorKeys.length; i++) {
+      this._addErrorMessageToAttribute(errorKeys[i], errors[errorKeys[i]]);
+    }
+
+  },
+
+  adapterErrorChanged(jsonApiError) {
+    /*
+    if (!jsonApiError) {
+      this.setProperties({
+        isError: false,
+        adapterError: null
+      });
+    } else {
+      this.setProperties({
+        isError: true,
+        adapterError: jsonApiError.meta,
+      });
+    }
+    */
+
+  },
+
+  _addErrorMessageToAttribute(attribute, message) {
+    this.get('errors')._add(attribute, message);
+  },
+
+  _clearErrorMessages() {
+    this.get('errors')._clear();
+  },
 
   /**
     Create a JSON representation of the record, using the serialization
@@ -718,6 +841,8 @@ const Model = EmberObject.extend(Evented, {
     @method rollbackAttributes
   */
   rollbackAttributes() {
+    this._markErrorRequestAsClean();  
+    this._markInvalidRequestAsClean();
     this._internalModel.rollbackAttributes();
   },
 
@@ -817,6 +942,10 @@ const Model = EmberObject.extend(Evented, {
       wrappedAdapterOptions = {
         adapterOptions: options.adapterOptions,
       };
+    } else if (!options) {
+      wrappedAdapterOptions = {};
+    } else {
+      wrappedAdapterOptions = options;
     }
 
     return PromiseObject.create({
@@ -1331,7 +1460,7 @@ Model.reopenClass({
     return relationship && store.modelFor(relationship.type);
   },
 
-  inverseMap: computed(function() {
+  inverseMap: computed(function () {
     return Object.create(null);
   }),
 
@@ -1401,10 +1530,10 @@ Model.reopenClass({
 
       assert(
         "We found no inverse relationships by the name of '" +
-          inverseName +
-          "' on the '" +
-          inverseType.modelName +
-          "' model. This is most likely due to a missing attribute on your model definition.",
+        inverseName +
+        "' on the '" +
+        inverseType.modelName +
+        "' model. This is most likely due to a missing attribute on your model definition.",
         !isNone(inverse)
       );
 
@@ -1436,12 +1565,12 @@ Model.reopenClass({
 
       assert(
         "You defined the '" +
-          name +
-          "' relationship on " +
-          this +
-          ', but you defined the inverse relationships of type ' +
-          inverseType.toString() +
-          ' multiple times. Look at https://guides.emberjs.com/current/models/relationships/#toc_explicit-inverses for how to explicitly specify inverses',
+        name +
+        "' relationship on " +
+        this +
+        ', but you defined the inverse relationships of type ' +
+        inverseType.toString() +
+        ' multiple times. Look at https://guides.emberjs.com/current/models/relationships/#toc_explicit-inverses for how to explicitly specify inverses',
         filteredRelationships.length < 2
       );
 
@@ -1451,14 +1580,14 @@ Model.reopenClass({
 
       assert(
         "You defined the '" +
-          name +
-          "' relationship on " +
-          this +
-          ', but multiple possible inverse relationships of type ' +
-          this +
-          ' were found on ' +
-          inverseType +
-          '. Look at https://guides.emberjs.com/current/models/relationships/#toc_explicit-inverses for how to explicitly specify inverses',
+        name +
+        "' relationship on " +
+        this +
+        ', but multiple possible inverse relationships of type ' +
+        this +
+        ' were found on ' +
+        inverseType +
+        '. Look at https://guides.emberjs.com/current/models/relationships/#toc_explicit-inverses for how to explicitly specify inverses',
         possibleRelationships.length === 1
       );
 
@@ -1469,9 +1598,9 @@ Model.reopenClass({
 
     assert(
       `The ${
-        inverseType.modelName
+      inverseType.modelName
       }:${inverseName} relationship declares 'inverse: null', but it was resolved as the inverse for ${
-        this.modelName
+      this.modelName
       }:${name}.`,
       !inverseOptions || inverseOptions.inverse !== null
     );
@@ -1561,7 +1690,7 @@ Model.reopenClass({
    @type Object
    @readOnly
    */
-  relationshipNames: computed(function() {
+  relationshipNames: computed(function () {
     let names = {
       hasMany: [],
       belongsTo: [],
@@ -1692,7 +1821,7 @@ Model.reopenClass({
    @type Map
    @readOnly
    */
-  fields: computed(function() {
+  fields: computed(function () {
     let map = new Map();
 
     this.eachComputedProperty((name, meta) => {
@@ -1801,14 +1930,15 @@ Model.reopenClass({
    @type {Map}
    @readOnly
    */
-  attributes: computed(function() {
+  attributes: computed(function () {
     let map = new Map();
+    //debugger
 
     this.eachComputedProperty((name, meta) => {
       if (meta.isAttribute) {
         assert(
           "You may not set `id` as an attribute on your model. Please remove any lines that look like: `id: DS.attr('<type>')` from " +
-            this.toString(),
+          this.toString(),
           name !== 'id'
         );
 
@@ -1858,7 +1988,7 @@ Model.reopenClass({
    @type {Map}
    @readOnly
    */
-  transformedAttributes: computed(function() {
+  transformedAttributes: computed(function () {
     let map = new Map();
 
     this.eachAttribute((key, meta) => {
